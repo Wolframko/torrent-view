@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -17,25 +18,45 @@ import (
 	syncpkg "github.com/user/torrent-view/internal/sync"
 )
 
+// Config holds server configuration
+type Config struct {
+	MaxViewers    int
+	AllowedOrigin string
+}
+
 // Server represents the HTTP API server
 type Server struct {
-	streamMgr   *stream.Manager
-	roomMgr     *syncpkg.RoomManager
-	room        *syncpkg.Room
-	upgrader    websocket.Upgrader
-	router      *mux.Router
+	streamMgr *stream.Manager
+	roomMgr   *syncpkg.RoomManager
+	room      *syncpkg.Room
+	upgrader  websocket.Upgrader
+	router    *mux.Router
+	config    Config
 }
 
 // NewServer creates a new API server
 func NewServer(streamMgr *stream.Manager) *Server {
+	return NewServerWithConfig(streamMgr, Config{
+		MaxViewers:    4,
+		AllowedOrigin: "", // Empty means allow all (for development)
+	})
+}
+
+// NewServerWithConfig creates a new API server with custom config
+func NewServerWithConfig(streamMgr *stream.Manager, config Config) *Server {
 	s := &Server{
 		streamMgr: streamMgr,
 		roomMgr:   syncpkg.NewRoomManager(),
+		config:    config,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
 			CheckOrigin: func(r *http.Request) bool {
-				return true // Allow all origins for development
+				if config.AllowedOrigin == "" {
+					return true // Development mode
+				}
+				origin := r.Header.Get("Origin")
+				return origin == config.AllowedOrigin
 			},
 		},
 	}
@@ -87,7 +108,12 @@ func (s *Server) handleAddMagnet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		jsonError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Magnet == "" {
+		jsonError(w, "Magnet link is required", http.StatusBadRequest)
 		return
 	}
 
@@ -110,13 +136,13 @@ func (s *Server) handleAddMagnet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAddTorrentFile(w http.ResponseWriter, r *http.Request) {
 	// Parse multipart form (max 10MB)
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+		jsonError(w, "Failed to parse form", http.StatusBadRequest)
 		return
 	}
 
 	file, _, err := r.FormFile("torrent")
 	if err != nil {
-		http.Error(w, "No torrent file provided", http.StatusBadRequest)
+		jsonError(w, "No torrent file provided", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
@@ -124,14 +150,16 @@ func (s *Server) handleAddTorrentFile(w http.ResponseWriter, r *http.Request) {
 	// Save to temp file
 	tmpFile, err := os.CreateTemp("", "torrent-*.torrent")
 	if err != nil {
-		http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+		log.Printf("Failed to create temp file: %v", err)
+		jsonError(w, "Failed to create temp file", http.StatusInternalServerError)
 		return
 	}
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
 
 	if _, err := io.Copy(tmpFile, file); err != nil {
-		http.Error(w, "Failed to save torrent file", http.StatusInternalServerError)
+		log.Printf("Failed to save torrent file: %v", err)
+		jsonError(w, "Failed to save torrent file", http.StatusInternalServerError)
 		return
 	}
 	tmpFile.Close()
@@ -164,7 +192,12 @@ func (s *Server) handleSelectVideo(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	index, err := strconv.Atoi(vars["index"])
 	if err != nil {
-		http.Error(w, "Invalid index", http.StatusBadRequest)
+		jsonError(w, "Invalid index", http.StatusBadRequest)
+		return
+	}
+
+	if index < 0 {
+		jsonError(w, "Index must be non-negative", http.StatusBadRequest)
 		return
 	}
 
@@ -179,8 +212,12 @@ func (s *Server) handleSelectVideo(w http.ResponseWriter, r *http.Request) {
 	info := s.streamMgr.GetInfo()
 
 	// Update room with stream info
-	infoData, _ := json.Marshal(info)
-	s.room.UpdateStreamInfo(infoData)
+	infoData, err := json.Marshal(info)
+	if err != nil {
+		log.Printf("Failed to marshal stream info: %v", err)
+	} else {
+		s.room.UpdateStreamInfo(infoData)
+	}
 
 	jsonResponse(w, info)
 }
@@ -196,7 +233,11 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Position float64 `json:"position"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Position is optional, default to 0
+		req.Position = 0
+	}
 
 	s.streamMgr.Play()
 	s.room.Play(req.Position)
@@ -209,7 +250,11 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Position float64 `json:"position"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Position is optional, default to 0
+		req.Position = 0
+	}
 
 	s.streamMgr.Pause()
 	s.room.Pause(req.Position)
@@ -224,7 +269,12 @@ func (s *Server) handleSeek(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		jsonError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Position < 0 {
+		jsonError(w, "Position must be non-negative", http.StatusBadRequest)
 		return
 	}
 
@@ -248,7 +298,7 @@ func (s *Server) handleUpdatePosition(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		jsonError(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
@@ -263,7 +313,12 @@ func (s *Server) handleSwitchAudio(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	index, err := strconv.Atoi(vars["index"])
 	if err != nil {
-		http.Error(w, "Invalid index", http.StatusBadRequest)
+		jsonError(w, "Invalid index", http.StatusBadRequest)
+		return
+	}
+
+	if index < 0 {
+		jsonError(w, "Index must be non-negative", http.StatusBadRequest)
 		return
 	}
 
@@ -276,8 +331,12 @@ func (s *Server) handleSwitchAudio(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Notify viewers about audio change
-	data, _ := json.Marshal(map[string]int{"index": index})
-	s.room.UpdateStreamInfo(data)
+	data, err := json.Marshal(map[string]int{"index": index})
+	if err != nil {
+		log.Printf("Failed to marshal audio change: %v", err)
+	} else {
+		s.room.UpdateStreamInfo(data)
+	}
 
 	jsonResponse(w, map[string]bool{"success": true})
 }
@@ -287,7 +346,13 @@ func (s *Server) handleSwitchSubtitle(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	index, err := strconv.Atoi(vars["index"])
 	if err != nil {
-		http.Error(w, "Invalid index", http.StatusBadRequest)
+		jsonError(w, "Invalid index", http.StatusBadRequest)
+		return
+	}
+
+	// -1 is valid (no subtitles)
+	if index < -1 {
+		jsonError(w, "Index must be >= -1", http.StatusBadRequest)
 		return
 	}
 
@@ -316,19 +381,28 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		name = "Anonymous"
 	}
 
+	// Sanitize name
+	if len(name) > 20 {
+		name = name[:20]
+	}
+
 	isHost := r.URL.Query().Get("host") == "true"
 
 	var client *syncpkg.Client
 	if isHost {
 		if s.room.HasHost() {
-			conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","data":{"message":"Room already has a host"}}`))
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","data":{"message":"Room already has a host"}}`)); err != nil {
+				log.Printf("Failed to send error message: %v", err)
+			}
 			conn.Close()
 			return
 		}
 		client = s.room.JoinAsHost(conn, name)
 	} else {
-		if s.room.GetViewerCount() >= 4 {
-			conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","data":{"message":"Room is full"}}`))
+		if s.room.GetViewerCount() >= s.config.MaxViewers {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","data":{"message":"Room is full"}}`)); err != nil {
+				log.Printf("Failed to send error message: %v", err)
+			}
 			conn.Close()
 			return
 		}
@@ -346,10 +420,32 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // handleHLS serves HLS segments and playlists
 func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	hlsDir := s.streamMgr.GetHLSDir()
-	filePath := filepath.Join(hlsDir, filepath.Clean(r.URL.Path))
 
-	// Security check
-	if !filepath.HasPrefix(filePath, hlsDir) {
+	// Clean and validate the path
+	requestedPath := filepath.Clean(r.URL.Path)
+
+	// Prevent path traversal
+	if strings.Contains(requestedPath, "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	filePath := filepath.Join(hlsDir, requestedPath)
+
+	// Ensure the resolved path is within hlsDir
+	absHlsDir, err := filepath.Abs(hlsDir)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	absFilePath, err := filepath.Abs(filePath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	if !strings.HasPrefix(absFilePath, absHlsDir) {
 		http.NotFound(w, r)
 		return
 	}
@@ -363,6 +459,9 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 	case ".ts":
 		w.Header().Set("Content-Type", "video/mp2t")
 		w.Header().Set("Cache-Control", "max-age=3600")
+	default:
+		http.NotFound(w, r)
+		return
 	}
 
 	// Allow CORS
@@ -374,12 +473,16 @@ func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
 // jsonResponse sends a JSON response
 func jsonResponse(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("Failed to encode JSON response: %v", err)
+	}
 }
 
 // jsonError sends a JSON error response
 func jsonError(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
+	if err := json.NewEncoder(w).Encode(map[string]string{"error": message}); err != nil {
+		log.Printf("Failed to encode JSON error response: %v", err)
+	}
 }

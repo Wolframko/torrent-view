@@ -3,12 +3,14 @@ package stream
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/user/torrent-view/internal/torrent"
@@ -48,27 +50,27 @@ func (s State) String() string {
 
 // StreamInfo contains current stream information
 type StreamInfo struct {
-	State           State                       `json:"state"`
-	TorrentName     string                      `json:"torrent_name"`
-	VideoFile       string                      `json:"video_file"`
-	Duration        float64                     `json:"duration"`
-	CurrentPosition float64                     `json:"current_position"`
-	BufferProgress  float64                     `json:"buffer_progress"`
-	AudioTracks     []transcoder.AudioTrack     `json:"audio_tracks"`
-	SubtitleTracks  []transcoder.SubtitleTrack  `json:"subtitle_tracks"`
-	SelectedAudio   int                         `json:"selected_audio"`
-	SelectedSub     int                         `json:"selected_subtitle"`
-	PlaylistURL     string                      `json:"playlist_url"`
-	Error           string                      `json:"error,omitempty"`
+	State           State                      `json:"state"`
+	TorrentName     string                     `json:"torrent_name"`
+	VideoFile       string                     `json:"video_file"`
+	Duration        float64                    `json:"duration"`
+	CurrentPosition float64                    `json:"current_position"`
+	BufferProgress  float64                    `json:"buffer_progress"`
+	AudioTracks     []transcoder.AudioTrack    `json:"audio_tracks"`
+	SubtitleTracks  []transcoder.SubtitleTrack `json:"subtitle_tracks"`
+	SelectedAudio   int                        `json:"selected_audio"`
+	SelectedSub     int                        `json:"selected_subtitle"`
+	PlaylistURL     string                     `json:"playlist_url"`
+	Error           string                     `json:"error,omitempty"`
 }
 
 // Manager manages the streaming pipeline
 type Manager struct {
-	torrentMgr  *torrent.Manager
-	transcoder  *transcoder.Transcoder
-	hlsConfig   transcoder.HLSConfig
-	dataDir     string
-	hlsDir      string
+	torrentMgr *torrent.Manager
+	transcoder *transcoder.Transcoder
+	hlsConfig  transcoder.HLSConfig
+	dataDir    string
+	hlsDir     string
 
 	mu              sync.RWMutex
 	state           State
@@ -76,11 +78,14 @@ type Manager struct {
 	selectedAudio   int
 	selectedSub     int
 	lastError       string
+	selectedVideo   int
 
 	// Segment cleanup
-	maxSegments    int
-	cleanupTicker  *time.Ticker
-	cleanupStop    chan struct{}
+	maxSegments   int
+	cleanupMu     sync.Mutex
+	cleanupTicker *time.Ticker
+	cleanupStop   chan struct{}
+	cleanupActive atomic.Bool
 }
 
 // NewManager creates a new stream manager
@@ -93,12 +98,13 @@ func NewManager(dataDir string, maxSegments int, bufferAheadMB int64) (*Manager,
 	}
 
 	m := &Manager{
-		torrentMgr:  torrentMgr,
-		transcoder:  transcoder.NewTranscoder(hlsDir),
-		dataDir:     dataDir,
-		hlsDir:      hlsDir,
-		maxSegments: maxSegments,
-		selectedSub: -1, // No subtitles by default
+		torrentMgr:    torrentMgr,
+		transcoder:    transcoder.NewTranscoder(hlsDir),
+		dataDir:       dataDir,
+		hlsDir:        hlsDir,
+		maxSegments:   maxSegments,
+		selectedSub:   -1,
+		selectedVideo: -1,
 		hlsConfig: transcoder.HLSConfig{
 			SegmentDuration: 4,
 			OutputDir:       hlsDir,
@@ -197,6 +203,7 @@ func (m *Manager) SelectVideo(ctx context.Context, index int) error {
 
 	// Set default audio track
 	m.mu.Lock()
+	m.selectedVideo = index
 	m.selectedAudio = 0
 	m.selectedSub = -1
 	for i, track := range mediaInfo.AudioTracks {
@@ -252,14 +259,15 @@ func (m *Manager) Seek(ctx context.Context, position float64) error {
 	m.mu.Lock()
 	prevState := m.state
 	m.state = StateLoading
+	selectedVideo := m.selectedVideo
 	m.mu.Unlock()
 
 	// Calculate byte offset for torrent
 	mediaInfo := m.transcoder.GetMediaInfo()
-	if mediaInfo != nil && mediaInfo.Duration > 0 {
+	if mediaInfo != nil && mediaInfo.Duration > 0 && selectedVideo >= 0 {
 		videos := m.torrentMgr.ListVideoFiles()
-		if len(videos) > 0 {
-			byteOffset := int64(float64(videos[0].Size) * (position / mediaInfo.Duration))
+		if selectedVideo < len(videos) {
+			byteOffset := int64(float64(videos[selectedVideo].Size) * (position / mediaInfo.Duration))
 			m.torrentMgr.SetPosition(byteOffset)
 		}
 	}
@@ -279,8 +287,15 @@ func (m *Manager) Seek(ctx context.Context, position float64) error {
 
 	m.mu.Lock()
 	m.currentPosition = position
-	m.state = prevState
-	if m.state == StateLoading {
+	// Restore previous state properly
+	switch prevState {
+	case StatePlaying:
+		m.state = StatePlaying
+	case StatePaused:
+		m.state = StatePaused
+	case StateLoading:
+		m.state = StateReady
+	default:
 		m.state = StateReady
 	}
 	m.mu.Unlock()
@@ -292,17 +307,22 @@ func (m *Manager) Seek(ctx context.Context, position float64) error {
 func (m *Manager) SetPosition(position float64) {
 	m.mu.Lock()
 	m.currentPosition = position
+	selectedVideo := m.selectedVideo
 	m.mu.Unlock()
 
 	// Update torrent position for prioritization
 	mediaInfo := m.transcoder.GetMediaInfo()
-	if mediaInfo != nil && mediaInfo.Duration > 0 {
-		videos := m.torrentMgr.ListVideoFiles()
-		if len(videos) > 0 {
-			byteOffset := int64(float64(videos[0].Size) * (position / mediaInfo.Duration))
-			m.torrentMgr.SetPosition(byteOffset)
-		}
+	if mediaInfo == nil || mediaInfo.Duration <= 0 || selectedVideo < 0 {
+		return
 	}
+
+	videos := m.torrentMgr.ListVideoFiles()
+	if selectedVideo >= len(videos) {
+		return
+	}
+
+	byteOffset := int64(float64(videos[selectedVideo].Size) * (position / mediaInfo.Duration))
+	m.torrentMgr.SetPosition(byteOffset)
 }
 
 // SwitchAudio switches to a different audio track
@@ -330,8 +350,6 @@ func (m *Manager) SwitchSubtitle(ctx context.Context, trackIndex int) error {
 // GetInfo returns current stream information
 func (m *Manager) GetInfo() StreamInfo {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	info := StreamInfo{
 		State:           m.state,
 		TorrentName:     m.torrentMgr.GetTorrentName(),
@@ -340,11 +358,13 @@ func (m *Manager) GetInfo() StreamInfo {
 		SelectedSub:     m.selectedSub,
 		Error:           m.lastError,
 	}
+	selectedVideo := m.selectedVideo
+	m.mu.RUnlock()
 
 	// Get video file info
 	videos := m.torrentMgr.ListVideoFiles()
-	if len(videos) > 0 {
-		info.VideoFile = videos[0].Path
+	if selectedVideo >= 0 && selectedVideo < len(videos) {
+		info.VideoFile = videos[selectedVideo].Path
 	}
 
 	// Get media info
@@ -362,7 +382,7 @@ func (m *Manager) GetInfo() StreamInfo {
 	}
 
 	// Set playlist URL if ready
-	if m.state == StateReady || m.state == StatePlaying || m.state == StatePaused {
+	if info.State == StateReady || info.State == StatePlaying || info.State == StatePaused {
 		info.PlaylistURL = "/hls/playlist.m3u8"
 	}
 
@@ -376,14 +396,20 @@ func (m *Manager) GetHLSDir() string {
 
 // startCleanup starts the segment cleanup goroutine
 func (m *Manager) startCleanup() {
-	if m.cleanupTicker != nil {
+	m.cleanupMu.Lock()
+	defer m.cleanupMu.Unlock()
+
+	if m.cleanupActive.Load() {
 		return
 	}
 
 	m.cleanupStop = make(chan struct{})
 	m.cleanupTicker = time.NewTicker(5 * time.Second)
+	m.cleanupActive.Store(true)
 
 	go func() {
+		defer m.cleanupActive.Store(false)
+
 		for {
 			select {
 			case <-m.cleanupTicker.C:
@@ -398,7 +424,12 @@ func (m *Manager) startCleanup() {
 // cleanupOldSegments removes old HLS segments to save disk space
 func (m *Manager) cleanupOldSegments() {
 	files, err := filepath.Glob(filepath.Join(m.hlsDir, "segment_*.ts"))
-	if err != nil || len(files) <= m.maxSegments {
+	if err != nil {
+		log.Printf("Failed to glob HLS segments: %v", err)
+		return
+	}
+
+	if len(files) <= m.maxSegments {
 		return
 	}
 
@@ -412,7 +443,9 @@ func (m *Manager) cleanupOldSegments() {
 	// Remove oldest segments
 	toRemove := len(files) - m.maxSegments
 	for i := 0; i < toRemove; i++ {
-		os.Remove(files[i])
+		if err := os.Remove(files[i]); err != nil {
+			log.Printf("Failed to remove old segment %s: %v", files[i], err)
+		}
 	}
 }
 
@@ -421,7 +454,10 @@ func extractSegmentNumber(filename string) int {
 	base := filepath.Base(filename)
 	base = strings.TrimPrefix(base, "segment_")
 	base = strings.TrimSuffix(base, ".ts")
-	num, _ := strconv.Atoi(base)
+	num, err := strconv.Atoi(base)
+	if err != nil {
+		return 0
+	}
 	return num
 }
 
@@ -431,13 +467,28 @@ func (m *Manager) Stop() {
 	m.state = StateIdle
 	m.mu.Unlock()
 
+	m.stopCleanup()
+	m.transcoder.Stop()
+}
+
+// stopCleanup safely stops the cleanup goroutine
+func (m *Manager) stopCleanup() {
+	m.cleanupMu.Lock()
+	defer m.cleanupMu.Unlock()
+
+	if !m.cleanupActive.Load() {
+		return
+	}
+
 	if m.cleanupTicker != nil {
 		m.cleanupTicker.Stop()
-		close(m.cleanupStop)
 		m.cleanupTicker = nil
 	}
 
-	m.transcoder.Stop()
+	if m.cleanupStop != nil {
+		close(m.cleanupStop)
+		m.cleanupStop = nil
+	}
 }
 
 // Close shuts down the manager

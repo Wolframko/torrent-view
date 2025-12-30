@@ -47,7 +47,7 @@ func main() {
 	}
 
 	// Handle graceful shutdown
-	done := make(chan bool)
+	done := make(chan struct{})
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,23 +16,23 @@ type MessageType string
 
 const (
 	// Host -> Viewers
-	MsgPlay          MessageType = "play"
-	MsgPause         MessageType = "pause"
-	MsgSeek          MessageType = "seek"
-	MsgSyncState     MessageType = "sync_state"
-	MsgBuffering     MessageType = "buffering"
-	MsgReady         MessageType = "ready"
-	MsgAudioChange   MessageType = "audio_change"
-	MsgSubChange     MessageType = "subtitle_change"
-	MsgStreamInfo    MessageType = "stream_info"
-	MsgViewerList    MessageType = "viewer_list"
-	MsgChat          MessageType = "chat"
-	MsgError         MessageType = "error"
+	MsgPlay        MessageType = "play"
+	MsgPause       MessageType = "pause"
+	MsgSeek        MessageType = "seek"
+	MsgSyncState   MessageType = "sync_state"
+	MsgBuffering   MessageType = "buffering"
+	MsgReady       MessageType = "ready"
+	MsgAudioChange MessageType = "audio_change"
+	MsgSubChange   MessageType = "subtitle_change"
+	MsgStreamInfo  MessageType = "stream_info"
+	MsgViewerList  MessageType = "viewer_list"
+	MsgChat        MessageType = "chat"
+	MsgError       MessageType = "error"
 
 	// Viewer -> Host
-	MsgRequestSync   MessageType = "request_sync"
-	MsgViewerReady   MessageType = "viewer_ready"
-	MsgViewerBuffer  MessageType = "viewer_buffering"
+	MsgRequestSync  MessageType = "request_sync"
+	MsgViewerReady  MessageType = "viewer_ready"
+	MsgViewerBuffer MessageType = "viewer_buffering"
 )
 
 // Message represents a sync message
@@ -59,15 +60,45 @@ type Viewer struct {
 
 // Client represents a WebSocket client
 type Client struct {
-	ID       string
-	Name     string
-	IsHost   bool
-	conn     *websocket.Conn
-	send     chan []byte
-	room     *Room
-	mu       sync.Mutex
-	isReady  bool
+	ID        string
+	Name      string
+	IsHost    bool
+	conn      *websocket.Conn
+	send      chan []byte
+	room      *Room
+	mu        sync.RWMutex
+	isReady   bool
 	buffering bool
+	closed    atomic.Bool
+}
+
+// safeSend sends data to client channel without panicking if closed
+func (c *Client) safeSend(data []byte) bool {
+	if c.closed.Load() {
+		return false
+	}
+
+	select {
+	case c.send <- data:
+		return true
+	default:
+		// Buffer full
+		return false
+	}
+}
+
+// getState returns client state safely
+func (c *Client) getState() (isReady, buffering bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.isReady, c.buffering
+}
+
+// close safely closes the client
+func (c *Client) close() {
+	if c.closed.CompareAndSwap(false, true) {
+		close(c.send)
+	}
 }
 
 // Room represents a viewing room with host and viewers
@@ -78,9 +109,9 @@ type Room struct {
 	mu      sync.RWMutex
 
 	// Playback state
-	playing   bool
-	position  float64
-	lastSync  time.Time
+	playing  bool
+	position float64
+	lastSync time.Time
 
 	// Stream info
 	streamInfo json.RawMessage
@@ -89,7 +120,8 @@ type Room struct {
 	broadcast chan *Message
 
 	// Close signal
-	done chan struct{}
+	done   chan struct{}
+	closed atomic.Bool
 }
 
 // NewRoom creates a new viewing room
@@ -117,16 +149,25 @@ func (r *Room) run() {
 
 		case <-ticker.C:
 			// Periodic sync state broadcast
-			if r.host != nil && r.playing {
-				r.mu.RLock()
+			r.mu.RLock()
+			hasHost := r.host != nil
+			playing := r.playing
+			position := r.position
+			r.mu.RUnlock()
+
+			if hasHost && playing {
 				state := SyncState{
-					Playing:   r.playing,
-					Position:  r.position,
+					Playing:   playing,
+					Position:  position,
 					Timestamp: time.Now().UnixMilli(),
 				}
-				r.mu.RUnlock()
 
-				data, _ := json.Marshal(state)
+				data, err := json.Marshal(state)
+				if err != nil {
+					log.Printf("Failed to marshal sync state: %v", err)
+					continue
+				}
+
 				r.broadcastToViewers(&Message{
 					Type:      MsgSyncState,
 					Timestamp: time.Now().UnixMilli(),
@@ -144,22 +185,24 @@ func (r *Room) run() {
 func (r *Room) broadcastMessage(msg *Message) {
 	data, err := json.Marshal(msg)
 	if err != nil {
+		log.Printf("Failed to marshal broadcast message: %v", err)
 		return
 	}
 
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	host := r.host
+	viewers := make([]*Client, 0, len(r.viewers))
+	for _, c := range r.viewers {
+		viewers = append(viewers, c)
+	}
+	r.mu.RUnlock()
 
-	if r.host != nil {
-		r.host.send <- data
+	if host != nil {
+		host.safeSend(data)
 	}
 
-	for _, client := range r.viewers {
-		select {
-		case client.send <- data:
-		default:
-			// Client buffer full, skip
-		}
+	for _, client := range viewers {
+		client.safeSend(data)
 	}
 }
 
@@ -167,17 +210,19 @@ func (r *Room) broadcastMessage(msg *Message) {
 func (r *Room) broadcastToViewers(msg *Message) {
 	data, err := json.Marshal(msg)
 	if err != nil {
+		log.Printf("Failed to marshal viewer message: %v", err)
 		return
 	}
 
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	viewers := make([]*Client, 0, len(r.viewers))
+	for _, c := range r.viewers {
+		viewers = append(viewers, c)
+	}
+	r.mu.RUnlock()
 
-	for _, client := range r.viewers {
-		select {
-		case client.send <- data:
-		default:
-		}
+	for _, client := range viewers {
+		client.safeSend(data)
 	}
 }
 
@@ -217,8 +262,6 @@ func (r *Room) JoinAsViewer(conn *websocket.Conn, name string) *Client {
 	r.mu.Unlock()
 
 	r.broadcastViewerList()
-
-	// Send current state to new viewer
 	r.sendCurrentState(client)
 
 	return client
@@ -228,15 +271,16 @@ func (r *Room) JoinAsViewer(conn *websocket.Conn, name string) *Client {
 func (r *Room) Leave(client *Client) {
 	r.mu.Lock()
 	if client.IsHost {
-		r.host = nil
-		// Pause playback when host leaves
+		if r.host == client {
+			r.host = nil
+		}
 		r.playing = false
 	} else {
 		delete(r.viewers, client.ID)
 	}
 	r.mu.Unlock()
 
-	close(client.send)
+	client.close()
 	r.broadcastViewerList()
 }
 
@@ -246,30 +290,41 @@ func (r *Room) broadcastViewerList() {
 	viewers := make([]Viewer, 0, len(r.viewers)+1)
 
 	if r.host != nil {
+		isReady, _ := r.host.getState()
 		viewers = append(viewers, Viewer{
-			ID:     r.host.ID,
-			Name:   r.host.Name,
-			IsHost: true,
-			IsReady: r.host.isReady,
+			ID:      r.host.ID,
+			Name:    r.host.Name,
+			IsHost:  true,
+			IsReady: isReady,
 		})
 	}
 
 	for _, v := range r.viewers {
+		isReady, buffering := v.getState()
 		viewers = append(viewers, Viewer{
 			ID:        v.ID,
 			Name:      v.Name,
 			IsHost:    false,
-			IsReady:   v.isReady,
-			Buffering: v.buffering,
+			IsReady:   isReady,
+			Buffering: buffering,
 		})
 	}
 	r.mu.RUnlock()
 
-	data, _ := json.Marshal(viewers)
-	r.broadcast <- &Message{
+	data, err := json.Marshal(viewers)
+	if err != nil {
+		log.Printf("Failed to marshal viewer list: %v", err)
+		return
+	}
+
+	select {
+	case r.broadcast <- &Message{
 		Type:      MsgViewerList,
 		Timestamp: time.Now().UnixMilli(),
 		Data:      data,
+	}:
+	default:
+		log.Printf("Broadcast channel full, dropping viewer list update")
 	}
 }
 
@@ -284,15 +339,25 @@ func (r *Room) sendCurrentState(client *Client) {
 	streamInfo := r.streamInfo
 	r.mu.RUnlock()
 
-	stateData, _ := json.Marshal(state)
+	stateData, err := json.Marshal(state)
+	if err != nil {
+		log.Printf("Failed to marshal state: %v", err)
+		return
+	}
+
 	msg := &Message{
 		Type:      MsgSyncState,
 		Timestamp: time.Now().UnixMilli(),
 		Data:      stateData,
 	}
 
-	data, _ := json.Marshal(msg)
-	client.send <- data
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Failed to marshal message: %v", err)
+		return
+	}
+
+	client.safeSend(data)
 
 	// Also send stream info if available
 	if len(streamInfo) > 0 {
@@ -301,8 +366,12 @@ func (r *Room) sendCurrentState(client *Client) {
 			Timestamp: time.Now().UnixMilli(),
 			Data:      streamInfo,
 		}
-		infoData, _ := json.Marshal(infoMsg)
-		client.send <- infoData
+		infoData, err := json.Marshal(infoMsg)
+		if err != nil {
+			log.Printf("Failed to marshal stream info: %v", err)
+			return
+		}
+		client.safeSend(infoData)
 	}
 }
 
@@ -312,10 +381,14 @@ func (r *Room) UpdateStreamInfo(info json.RawMessage) {
 	r.streamInfo = info
 	r.mu.Unlock()
 
-	r.broadcast <- &Message{
+	select {
+	case r.broadcast <- &Message{
 		Type:      MsgStreamInfo,
 		Timestamp: time.Now().UnixMilli(),
 		Data:      info,
+	}:
+	default:
+		log.Printf("Broadcast channel full, dropping stream info update")
 	}
 }
 
@@ -327,11 +400,20 @@ func (r *Room) Play(position float64) {
 	r.lastSync = time.Now()
 	r.mu.Unlock()
 
-	data, _ := json.Marshal(map[string]float64{"position": position})
-	r.broadcast <- &Message{
+	data, err := json.Marshal(map[string]float64{"position": position})
+	if err != nil {
+		log.Printf("Failed to marshal play data: %v", err)
+		return
+	}
+
+	select {
+	case r.broadcast <- &Message{
 		Type:      MsgPlay,
 		Timestamp: time.Now().UnixMilli(),
 		Data:      data,
+	}:
+	default:
+		log.Printf("Broadcast channel full, dropping play command")
 	}
 }
 
@@ -342,11 +424,20 @@ func (r *Room) Pause(position float64) {
 	r.position = position
 	r.mu.Unlock()
 
-	data, _ := json.Marshal(map[string]float64{"position": position})
-	r.broadcast <- &Message{
+	data, err := json.Marshal(map[string]float64{"position": position})
+	if err != nil {
+		log.Printf("Failed to marshal pause data: %v", err)
+		return
+	}
+
+	select {
+	case r.broadcast <- &Message{
 		Type:      MsgPause,
 		Timestamp: time.Now().UnixMilli(),
 		Data:      data,
+	}:
+	default:
+		log.Printf("Broadcast channel full, dropping pause command")
 	}
 }
 
@@ -357,11 +448,20 @@ func (r *Room) Seek(position float64) {
 	r.lastSync = time.Now()
 	r.mu.Unlock()
 
-	data, _ := json.Marshal(map[string]float64{"position": position})
-	r.broadcast <- &Message{
+	data, err := json.Marshal(map[string]float64{"position": position})
+	if err != nil {
+		log.Printf("Failed to marshal seek data: %v", err)
+		return
+	}
+
+	select {
+	case r.broadcast <- &Message{
 		Type:      MsgSeek,
 		Timestamp: time.Now().UnixMilli(),
 		Data:      data,
+	}:
+	default:
+		log.Printf("Broadcast channel full, dropping seek command")
 	}
 }
 
@@ -388,16 +488,26 @@ func (r *Room) HasHost() bool {
 
 // Close closes the room
 func (r *Room) Close() {
+	if !r.closed.CompareAndSwap(false, true) {
+		return // Already closed
+	}
+
 	close(r.done)
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.host != nil {
-		r.host.conn.Close()
-	}
-
+	host := r.host
+	viewers := make([]*Client, 0, len(r.viewers))
 	for _, v := range r.viewers {
+		viewers = append(viewers, v)
+	}
+	r.host = nil
+	r.viewers = make(map[string]*Client)
+	r.mu.Unlock()
+
+	if host != nil {
+		host.conn.Close()
+	}
+	for _, v := range viewers {
 		v.conn.Close()
 	}
 }
@@ -419,7 +529,7 @@ func (c *Client) HandleMessages() {
 	for {
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
 				log.Printf("WebSocket error: %v", err)
 			}
 			break
@@ -427,6 +537,7 @@ func (c *Client) HandleMessages() {
 
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
+			log.Printf("Failed to unmarshal message: %v", err)
 			continue
 		}
 
@@ -450,27 +561,44 @@ func (c *Client) handleMessage(msg *Message) {
 		var buffering struct {
 			Buffering bool `json:"buffering"`
 		}
-		json.Unmarshal(msg.Data, &buffering)
+		if err := json.Unmarshal(msg.Data, &buffering); err != nil {
+			log.Printf("Failed to unmarshal buffering data: %v", err)
+			return
+		}
 		c.mu.Lock()
 		c.buffering = buffering.Buffering
 		c.mu.Unlock()
 		c.room.broadcastViewerList()
 
 	case MsgChat:
-		if len(msg.Data) > 0 {
-			// Add sender info and broadcast
-			var chatData map[string]interface{}
-			json.Unmarshal(msg.Data, &chatData)
-			chatData["sender_id"] = c.ID
-			chatData["sender_name"] = c.Name
-			chatData["is_host"] = c.IsHost
+		if len(msg.Data) == 0 {
+			return
+		}
 
-			newData, _ := json.Marshal(chatData)
-			c.room.broadcast <- &Message{
-				Type:      MsgChat,
-				Timestamp: time.Now().UnixMilli(),
-				Data:      newData,
-			}
+		var chatData map[string]interface{}
+		if err := json.Unmarshal(msg.Data, &chatData); err != nil {
+			log.Printf("Failed to unmarshal chat data: %v", err)
+			return
+		}
+
+		chatData["sender_id"] = c.ID
+		chatData["sender_name"] = c.Name
+		chatData["is_host"] = c.IsHost
+
+		newData, err := json.Marshal(chatData)
+		if err != nil {
+			log.Printf("Failed to marshal chat data: %v", err)
+			return
+		}
+
+		select {
+		case c.room.broadcast <- &Message{
+			Type:      MsgChat,
+			Timestamp: time.Now().UnixMilli(),
+			Data:      newData,
+		}:
+		default:
+			log.Printf("Broadcast channel full, dropping chat message")
 		}
 	}
 }
@@ -496,8 +624,13 @@ func (c *Client) WritePump() {
 			if err != nil {
 				return
 			}
-			w.Write(message)
-			w.Close()
+			if _, err := w.Write(message); err != nil {
+				w.Close()
+				return
+			}
+			if err := w.Close(); err != nil {
+				return
+			}
 
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
