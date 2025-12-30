@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Torrent View - Watch Together</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- Join Screen -->
+        <div id="join-screen" class="screen active">
+            <div class="container">
+                <h1>Torrent View</h1>
+                <p class="subtitle">Watch torrents together with friends</p>
+
+                <div class="join-form">
+                    <input type="text" id="username" placeholder="Your name" maxlength="20">
+                    <div class="join-buttons">
+                        <button id="btn-host" class="btn btn-primary">Create Room (Host)</button>
+                        <button id="btn-join" class="btn btn-secondary">Join as Viewer</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Host Screen -->
+        <div id="host-screen" class="screen">
+            <div class="main-layout">
+                <!-- Video Area -->
+                <div class="video-area">
+                    <div class="video-container">
+                        <video id="video-player" playsinline></video>
+                        <div id="loading-overlay" class="overlay">
+                            <div class="spinner"></div>
+                            <p id="loading-text">Loading...</p>
+                        </div>
+                    </div>
+
+                    <!-- Video Controls -->
+                    <div class="video-controls" id="video-controls">
+                        <div class="progress-bar" id="progress-bar">
+                            <div class="progress-buffered" id="progress-buffered"></div>
+                            <div class="progress-played" id="progress-played"></div>
+                            <div class="progress-handle" id="progress-handle"></div>
+                        </div>
+                        <div class="controls-row">
+                            <div class="controls-left">
+                                <button id="btn-play-pause" class="control-btn">
+                                    <span class="icon-play">&#9658;</span>
+                                    <span class="icon-pause" style="display:none;">&#10074;&#10074;</span>
+                                </button>
+                                <span id="time-display">0:00 / 0:00</span>
+                            </div>
+                            <div class="controls-right">
+                                <select id="audio-select" class="control-select" title="Audio Track">
+                                    <option value="0">Audio</option>
+                                </select>
+                                <select id="subtitle-select" class="control-select" title="Subtitles">
+                                    <option value="-1">No Subtitles</option>
+                                </select>
+                                <button id="btn-fullscreen" class="control-btn" title="Fullscreen">&#x26F6;</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sidebar -->
+                <div class="sidebar">
+                    <!-- Torrent Panel -->
+                    <div class="panel" id="torrent-panel">
+                        <h3>Add Torrent</h3>
+                        <div class="torrent-input">
+                            <input type="text" id="magnet-input" placeholder="Paste magnet link...">
+                            <button id="btn-add-magnet" class="btn btn-small">Add</button>
+                        </div>
+                        <div class="torrent-upload">
+                            <input type="file" id="torrent-file" accept=".torrent" hidden>
+                            <button id="btn-upload-torrent" class="btn btn-small btn-outline">Upload .torrent</button>
+                        </div>
+                    </div>
+
+                    <!-- File Selection -->
+                    <div class="panel" id="files-panel" style="display: none;">
+                        <h3>Select Video</h3>
+                        <div id="file-list" class="file-list"></div>
+                    </div>
+
+                    <!-- Viewers Panel -->
+                    <div class="panel">
+                        <h3>Viewers <span id="viewer-count">(0)</span></h3>
+                        <div id="viewer-list" class="viewer-list"></div>
+                    </div>
+
+                    <!-- Chat Panel -->
+                    <div class="panel chat-panel">
+                        <h3>Chat</h3>
+                        <div id="chat-messages" class="chat-messages"></div>
+                        <div class="chat-input">
+                            <input type="text" id="chat-input" placeholder="Send message...">
+                            <button id="btn-send-chat" class="btn btn-small">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Viewer Screen -->
+        <div id="viewer-screen" class="screen">
+            <div class="main-layout">
+                <!-- Video Area -->
+                <div class="video-area">
+                    <div class="video-container">
+                        <video id="viewer-video-player" playsinline></video>
+                        <div id="viewer-loading-overlay" class="overlay">
+                            <div class="spinner"></div>
+                            <p id="viewer-loading-text">Waiting for host...</p>
+                        </div>
+                        <div id="sync-indicator" class="sync-indicator">Synced</div>
+                    </div>
+
+                    <!-- Viewer Controls (read-only progress) -->
+                    <div class="video-controls viewer-controls">
+                        <div class="progress-bar">
+                            <div class="progress-buffered" id="viewer-progress-buffered"></div>
+                            <div class="progress-played" id="viewer-progress-played"></div>
+                        </div>
+                        <div class="controls-row">
+                            <div class="controls-left">
+                                <span id="viewer-status" class="viewer-status">Paused</span>
+                                <span id="viewer-time-display">0:00 / 0:00</span>
+                            </div>
+                            <div class="controls-right">
+                                <button id="btn-viewer-fullscreen" class="control-btn" title="Fullscreen">&#x26F6;</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sidebar -->
+                <div class="sidebar">
+                    <!-- Stream Info -->
+                    <div class="panel">
+                        <h3>Now Playing</h3>
+                        <p id="viewer-stream-info">Waiting for stream...</p>
+                    </div>
+
+                    <!-- Viewers Panel -->
+                    <div class="panel">
+                        <h3>Viewers <span id="viewer-viewer-count">(0)</span></h3>
+                        <div id="viewer-viewer-list" class="viewer-list"></div>
+                    </div>
+
+                    <!-- Chat Panel -->
+                    <div class="panel chat-panel">
+                        <h3>Chat</h3>
+                        <div id="viewer-chat-messages" class="chat-messages"></div>
+                        <div class="chat-input">
+                            <input type="text" id="viewer-chat-input" placeholder="Send message...">
+                            <button id="btn-viewer-send-chat" class="btn btn-small">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="player.js"></script>
+</body>
+</html>
